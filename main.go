@@ -88,8 +88,8 @@ func saveSentIncidents(filename string, sentIDs map[int]bool) error {
 // sendToDiscord sends a notification for a new vehicle crash.
 func sendToDiscord(webhookURL string, incident Incident, formattedTime string) {
 	message := fmt.Sprintf(
-		"🚨 **Vehicle Crash Alert** 🚨\n\n"+
-			"**Road:** %s\n"+
+		"🚨 **Vehicle Crash Alert** 🚨\n\n"+			
+		"**Road:** %s\n"+
 			"**City:** %s\n"+
 			"**Location:** %s\n"+
 			"**Reason:** %s\n"+
