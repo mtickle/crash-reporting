@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/joho/godotenv" // Library to read .env files
@@ -48,8 +49,29 @@ type Incident struct {
 	WorkZoneSpeedLimit    int     `json:"workZoneSpeedLimit" db:"work_zone_speed_limit"`
 }
 
-type DiscordWebhookBody struct {
-	Content string `json:"content"`
+// Structs for creating a rich Discord Embed
+type DiscordWebhookPayload struct {
+	Username  string         `json:"username"`
+	AvatarURL string         `json:"avatar_url,omitempty"`
+	Embeds    []DiscordEmbed `json:"embeds"`
+}
+
+type DiscordEmbed struct {
+	Title     string       `json:"title"`
+	Color     int          `json:"color"`
+	Fields    []EmbedField `json:"fields"`
+	Footer    EmbedFooter  `json:"footer"`
+	Timestamp string       `json:"timestamp"`
+}
+
+type EmbedField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline"`
+}
+
+type EmbedFooter struct {
+	Text string `json:"text"`
 }
 
 // ClearedIncident holds just enough info for a cleared notification.
@@ -85,26 +107,44 @@ func saveSentIncidents(filename string, sentIDs map[int]bool) error {
 	return os.WriteFile(filename, data, 0644)
 }
 
-// sendToDiscord sends a notification for a new vehicle crash.
-func sendToDiscord(webhookURL string, incident Incident, formattedTime string) {
-	message := fmt.Sprintf(
-		"🚨 **Vehicle Crash Alert** 🚨\n\n"+
-			"**Road:** %s\n"+
-			"**City:** %s\n"+
-			"**Location:** %s\n"+
-			"**Reason:** %s\n"+
-			"**Started:** %s\n"+
-			"**Map Link:** [View on Google Maps](https://www.google.com/maps?q=%.6f,%.6f&z=12)",
-		incident.Road,
-		incident.City,
-		incident.Location,
-		incident.Reason,
-		formattedTime,
-		incident.Latitude,
-		incident.Longitude,
-	)
+// sendToDiscord sends a rich, color-coded embed for a new vehicle crash.
+func sendToDiscord(webhookURL string, incident Incident, parsedTime time.Time) {
+	// Determine embed color based on severity
+	var color int
+	switch incident.Severity {
+	case 1:
+		color = 3066993 // Green
+	case 2:
+		color = 16776960 // Yellow
+	case 3:
+		color = 15158332 // Red
+	default:
+		color = 2105893 // Grey
+	}
 
-	payload := DiscordWebhookBody{Content: message}
+	mapLink := fmt.Sprintf("[View on Google Maps](https://www.google.com/maps?q=%.6f,%.6f&z=12)", incident.Latitude, incident.Longitude)
+
+	fields := []EmbedField{
+		{Name: "Reason", Value: incident.Reason, Inline: false},
+		{Name: "Road", Value: incident.Road, Inline: true},
+		{Name: "Location", Value: incident.Location, Inline: true},
+		{Name: "Severity", Value: strconv.Itoa(incident.Severity), Inline: true},
+		{Name: "Map", Value: mapLink, Inline: false},
+	}
+
+	embed := DiscordEmbed{
+		Title:     "🚨 New Vehicle Crash Alert 🚨",
+		Color:     color,
+		Fields:    fields,
+		Footer:    EmbedFooter{Text: "Fetched from NC DOT API"},
+		Timestamp: parsedTime.Format(time.RFC3339),
+	}
+
+	payload := DiscordWebhookPayload{
+		Username: "NC DOT Crash Bot",
+		Embeds:   []DiscordEmbed{embed},
+	}
+
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("Error creating JSON payload: %s", err)
@@ -123,19 +163,25 @@ func sendToDiscord(webhookURL string, incident Incident, formattedTime string) {
 	}
 }
 
-// sendClearedNotificationToDiscord sends an alert when an incident is no longer active.
+// sendClearedNotificationToDiscord sends a rich embed when an incident is cleared.
 func sendClearedNotificationToDiscord(webhookURL string, incident ClearedIncident) {
-	message := fmt.Sprintf(
-		"✅ **Incident Cleared** ✅\n\n"+
-			"**Road:** %s\n"+
-			"**Location:** %s\n"+
-			"**City:** %s",
-		incident.Road,
-		incident.Location,
-		incident.City,
-	)
+	embed := DiscordEmbed{
+		Title: "✅ Incident Cleared ✅",
+		Color: 3066993, // Green
+		Fields: []EmbedField{
+			{Name: "Road", Value: incident.Road, Inline: true},
+			{Name: "Location", Value: incident.Location, Inline: true},
+			{Name: "City", Value: incident.City, Inline: true},
+		},
+		Footer:    EmbedFooter{Text: "Incident no longer in NC DOT feed"},
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
 
-	payload := DiscordWebhookBody{Content: message}
+	payload := DiscordWebhookPayload{
+		Username: "NC DOT Crash Bot",
+		Embeds:   []DiscordEmbed{embed},
+	}
+
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("Error creating cleared JSON payload: %s", err)
@@ -241,12 +287,10 @@ func clearOldCrashes(db *sql.DB, currentCrashIDs map[int]bool, webhookURL string
 }
 
 func main() {
-	// --- Load .env file ---
 	if err := godotenv.Load(); err != nil {
 		log.Println("Note: .env file not found, reading credentials from environment")
 	}
 
-	// --- Database Connection ---
 	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=require",
 		os.Getenv("DATABASE_HOST"), os.Getenv("DATABASE_PORT"), os.Getenv("DATABASE_USERNAME"),
 		os.Getenv("DATABASE_PASSWORD"), os.Getenv("DATABASE_NAME"))
@@ -262,18 +306,20 @@ func main() {
 	}
 	log.Println("Successfully connected to the database.")
 
-	// --- App Setup ---
-	url := "https://eapps.ncdot.gov/services/traffic-prod/v1/counties/92/incidents"
-	webhookURL := "https://discord.com/api/webhooks/1416378140216922162/4xh5sATlKyECNwEzP05G-Vmg4kGw3XmxsEG8Aezh3tDbW3tD6hfNO5Ev-UOZmJvDQAoR" // IMPORTANT: Replace with your actual webhook URL
+	dotURL := os.Getenv("DOT_URL")
+	webhookURL := os.Getenv("DISCORD_HOOK")
 	stateFilename := "sent_incidents_ncdot.json"
+
+	if dotURL == "" || webhookURL == "" {
+		log.Fatalln("Error: DOT_URL and DISCORD_HOOK must be set in your environment or .env file.")
+	}
 
 	sentIDs, err := loadSentIncidents(stateFilename)
 	if err != nil {
 		log.Fatalf("Error loading sent incidents: %s", err)
 	}
 
-	// --- Fetch and Process Data ---
-	resp, err := http.Get(url)
+	resp, err := http.Get(dotURL)
 	if err != nil {
 		log.Fatalf("Error fetching data: %s\n", err)
 	}
@@ -289,7 +335,6 @@ func main() {
 		log.Fatalf("Error unmarshalling JSON: %s\n", err)
 	}
 
-	// --- Filter for only Vehicle Crashes ---
 	var vehicleCrashes []Incident
 	for _, incident := range allIncidents {
 		if incident.IncidentType == "Vehicle Crash" {
@@ -305,43 +350,31 @@ func main() {
 
 	log.Println("Processing current vehicle crashes from feed...")
 	for _, crash := range vehicleCrashes {
-		// Only save vehicle crashes to the database
 		if err := upsertIncident(db, crash); err != nil {
 			log.Printf("Error upserting crash %d: %s", crash.ID, err)
 		}
 
-		// Check if a Discord alert has already been sent for this crash
 		if !sentIDs[crash.ID] {
 			log.Printf("Found new crash (ID: %d). Sending to Discord...", crash.ID)
 
-			// --- TIMEZONE CONVERSION ---
-			loc, err := time.LoadLocation("America/New_York")
-			if err != nil {
-				log.Printf("Error loading location for timezone conversion: %s", err)
-				continue
-			}
-
 			parsedTime, err := time.Parse(time.RFC3339, crash.StartTime)
-			var formattedTime string
 			if err != nil {
-				formattedTime = crash.StartTime // Fallback to original string
-			} else {
-				easternTime := parsedTime.In(loc)
-				formattedTime = easternTime.Format("Mon, Jan 2, 3:04 PM EST")
+				log.Printf("Error parsing timestamp for crash %d: %s. Using current time.", crash.ID, err)
+				parsedTime = time.Now()
 			}
 
-			sendToDiscord(webhookURL, crash, formattedTime)
+			// Note: We no longer need to convert to a formatted string here.
+			// The sendToDiscord function now handles the timestamp.
+			sendToDiscord(webhookURL, crash, parsedTime)
 			sentIDs[crash.ID] = true
 		}
 	}
 	log.Printf("Upserted/updated %d crashes in the database.", len(vehicleCrashes))
 
-	// Check for any crashes that are no longer in the feed
 	if err := clearOldCrashes(db, currentCrashIDs, webhookURL); err != nil {
 		log.Printf("Error during clearing of old crashes: %s", err)
 	}
 
-	// Save the updated list of sent Discord alerts
 	if err := saveSentIncidents(stateFilename, sentIDs); err != nil {
 		log.Printf("Error saving sent incidents file: %s", err)
 	}
