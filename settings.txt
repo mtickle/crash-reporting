@@ -1,0 +1,2 @@
+DISCORD_HOOK="https://discord.com/api/webhooks/1416378140216922162/4xh5sATlKyECNwEzP05G-Vmg4kGw3XmxsEG8Aezh3tDbW3tD6hfNO5Ev-UOZmJvDQAoR"
+DOT_URL="https://eapps.ncdot.gov/services/traffic-prod/v1/counties/92/incidents"
