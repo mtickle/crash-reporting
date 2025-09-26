@@ -49,7 +49,7 @@ type Incident struct {
 	WorkZoneSpeedLimit    int     `json:"workZoneSpeedLimit" db:"work_zone_speed_limit"`
 }
 
-// Structs for creating a rich Discord Embed
+// Structs for creating a rich Discord Embed with a thumbnail
 type DiscordWebhookPayload struct {
 	Username  string         `json:"username"`
 	AvatarURL string         `json:"avatar_url,omitempty"`
@@ -57,11 +57,16 @@ type DiscordWebhookPayload struct {
 }
 
 type DiscordEmbed struct {
-	Title     string       `json:"title"`
-	Color     int          `json:"color"`
-	Fields    []EmbedField `json:"fields"`
-	Footer    EmbedFooter  `json:"footer"`
-	Timestamp string       `json:"timestamp"`
+	Title     string         `json:"title"`
+	Color     int            `json:"color"`
+	Fields    []EmbedField   `json:"fields"`
+	Footer    EmbedFooter    `json:"footer"`
+	Timestamp string         `json:"timestamp"`
+	Thumbnail EmbedThumbnail `json:"thumbnail,omitempty"`
+}
+
+type EmbedThumbnail struct {
+	URL string `json:"url"`
 }
 
 type EmbedField struct {
@@ -87,15 +92,23 @@ func loadSentIncidents(filename string) (map[int]bool, error) {
 	sentIDs := make(map[int]bool)
 	data, err := os.ReadFile(filename)
 	if os.IsNotExist(err) {
-		return sentIDs, nil
+		return sentIDs, nil // File doesn't exist, which is fine.
 	} else if err != nil {
-		return nil, err
+		return nil, err // A real file system error occurred.
 	}
+
 	if len(data) == 0 {
-		return sentIDs, nil
+		return sentIDs, nil // File is empty, which is also fine.
 	}
+
 	err = json.Unmarshal(data, &sentIDs)
-	return sentIDs, err
+	// If the file is corrupt and not valid JSON, log a warning and start fresh.
+	if err != nil {
+		log.Printf("WARNING: Could not parse %s. File may be corrupt. Starting with a fresh state. Error: %v", filename, err)
+		return make(map[int]bool), nil // Return an empty map, not an error.
+	}
+
+	return sentIDs, nil
 }
 
 // saveSentIncidents writes the updated map of sent alert IDs back to the file.
@@ -108,7 +121,7 @@ func saveSentIncidents(filename string, sentIDs map[int]bool) error {
 }
 
 // sendToDiscord sends a rich, color-coded embed for a new vehicle crash.
-func sendToDiscord(webhookURL string, incident Incident, parsedTime time.Time) {
+func sendToDiscord(webhookURL string, incident Incident, parsedTime time.Time, mapsAPIKey string) {
 	// Determine embed color based on severity
 	var color int
 	switch incident.Severity {
@@ -122,22 +135,29 @@ func sendToDiscord(webhookURL string, incident Incident, parsedTime time.Time) {
 		color = 2105893 // Grey
 	}
 
-	mapLink := fmt.Sprintf("[View on Google Maps](https://www.google.com/maps?q=%.6f,%.6f&z=12)", incident.Latitude, incident.Longitude)
-
+	// All fields are now single-column (Inline: false) for mobile readability.
 	fields := []EmbedField{
 		{Name: "Reason", Value: incident.Reason, Inline: false},
-		{Name: "Road", Value: incident.Road, Inline: true},
-		{Name: "Location", Value: incident.Location, Inline: true},
-		{Name: "Severity", Value: strconv.Itoa(incident.Severity), Inline: true},
-		{Name: "Map", Value: mapLink, Inline: false},
+		{Name: "Road", Value: incident.Road, Inline: false},
+		{Name: "Location", Value: incident.Location, Inline: false},
+		{Name: "Severity", Value: strconv.Itoa(incident.Severity), Inline: false},
 	}
 
 	embed := DiscordEmbed{
-		Title:     "🚨 New Vehicle Crash Alert 🚨",
+		Title:     "New Vehicle Crash Alert",
 		Color:     color,
 		Fields:    fields,
 		Footer:    EmbedFooter{Text: "Fetched from NC DOT API"},
 		Timestamp: parsedTime.Format(time.RFC3339),
+	}
+
+	// Generate and add the static map thumbnail if an API key is provided.
+	if mapsAPIKey != "" {
+		mapURL := fmt.Sprintf(
+			"https://maps.googleapis.com/maps/api/staticmap?center=%.6f,%.6f&zoom=14&size=600x600&markers=color:red%%7C%.6f,%.6f&key=%s",
+			incident.Latitude, incident.Longitude, incident.Latitude, incident.Longitude, mapsAPIKey,
+		)
+		embed.Thumbnail = EmbedThumbnail{URL: mapURL}
 	}
 
 	payload := DiscordWebhookPayload{
@@ -166,12 +186,12 @@ func sendToDiscord(webhookURL string, incident Incident, parsedTime time.Time) {
 // sendClearedNotificationToDiscord sends a rich embed when an incident is cleared.
 func sendClearedNotificationToDiscord(webhookURL string, incident ClearedIncident) {
 	embed := DiscordEmbed{
-		Title: "✅ Incident Cleared ✅",
+		Title: "Incident Cleared ",
 		Color: 3066993, // Green
 		Fields: []EmbedField{
-			{Name: "Road", Value: incident.Road, Inline: true},
-			{Name: "Location", Value: incident.Location, Inline: true},
-			{Name: "City", Value: incident.City, Inline: true},
+			{Name: "Road", Value: incident.Road, Inline: false},
+			{Name: "Location", Value: incident.Location, Inline: false},
+			{Name: "City", Value: incident.City, Inline: false},
 		},
 		Footer:    EmbedFooter{Text: "Incident no longer in NC DOT feed"},
 		Timestamp: time.Now().Format(time.RFC3339),
@@ -308,6 +328,7 @@ func main() {
 
 	dotURL := os.Getenv("DOT_URL")
 	webhookURL := os.Getenv("DISCORD_HOOK")
+	mapsAPIKey := os.Getenv("GOOGLE_MAPS_API_KEY")
 	stateFilename := "sent_incidents_ncdot.json"
 
 	if dotURL == "" || webhookURL == "" {
@@ -316,6 +337,7 @@ func main() {
 
 	sentIDs, err := loadSentIncidents(stateFilename)
 	if err != nil {
+		// This fatal error will now only trigger for actual file system issues, not bad JSON.
 		log.Fatalf("Error loading sent incidents: %s", err)
 	}
 
@@ -363,9 +385,7 @@ func main() {
 				parsedTime = time.Now()
 			}
 
-			// Note: We no longer need to convert to a formatted string here.
-			// The sendToDiscord function now handles the timestamp.
-			sendToDiscord(webhookURL, crash, parsedTime)
+			sendToDiscord(webhookURL, crash, parsedTime, mapsAPIKey)
 			sentIDs[crash.ID] = true
 		}
 	}
